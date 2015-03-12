@@ -1,0 +1,122 @@
+\documentclass[a4paper,12pt]{article}
+\usepackage[margin=2cm]{geometry}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{enumerate}
+\usepackage{amsmath, amssymb}
+\usepackage{mathtools}
+\usepackage{minted}
+\setlength\parindent{0pt}
+\setcounter{secnumdepth}{0}
+\pagestyle{empty}
+
+\newcommand{\code}{\texttt}
+
+% Graphics
+% \begin{figure}[h]
+% \centering
+% \includegraphics[width=]{}
+% \label{}
+% \end{figure}
+
+\title{
+Implementing a Generic Radix Trie in Rust
+}
+\author{
+\textsc{Michael Sproul}\\
+University of California, Santa Cruz
+}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+
+Rust is a systems programming language developed by Mozilla Research that is rapidly approaching its 1.0 release. Built on an imperative core with C-like syntax, Rust also includes several sophisticated features inspired by the ML family of languages. Notable features include type generics, traits (similar to Haskell's type classes), type inference, algebraic data types and pattern matching.  Rust's status as a systems programming language is established by its memory management system, which guarantees memory safety without garbage collection. It achieves this through a system of ownership and borrowing inspired by the Cyclone Programming Language [reference].\\
+
+A trie is a tree data structure which differentiates its keys by treating them as sequences of characters from a finite alphabet. Each node of a trie contains a bucket for each alphabet character and each key-value pair is stored so that the path from the root node matches the key's character representation. In this paper, I take the term \textit{radix trie} to mean any trie which compresses common prefixes, of which a PATRICIA trie is a variant with 2-way branching. To achieve generality, my trie takes its alphabet to be the set of 4-digit binary numbers, thus allowing any type which can be serialised as a sequence of bytes to be used as a key. This yields 16-way branching, in contrast to the 2-way branching of a PATRICIA trie, which uses single binary digits as its alphabet. One further difference between the radix trie implemented and other implementations I've come across is that my trie allows values to be stored in internal nodes.
+
+\section{Ownership, Borrowing and Trees}
+
+Rust's ownership system [reference] interacts in several interesting ways with hierarchical data-structures. The following two sections discuss my experiences with Rust's memory management, including some ownership related challenges and their solutions.
+
+\subsection{Positive Interactions}
+
+The core type used to implement the radix trie is a struct which contains an array of pointers to its children.
+
+\begin{minted}{rust}
+struct TrieNode<K, V> {
+    key: NibbleVec,
+    key_value: Option<KeyValue<K, V>>,
+    children: [Option<Box<TrieNode<K, V>>>; BRANCH_FACTOR],
+    child_count: usize
+}
+\end{minted}
+
+The \code{NibbleVec} type is a wrapper I wrote around a vector of bytes that behaves like an array of 4-byte values (nibbles). The \code{Box} type is an \textit{owned} pointer type which allows the \code{TrieNode} type to be recursive without being infinitely sized. Rust's box pointers are the core point of interaction between the Trie and Rust's ownership system. In some ways, the move semantics for owned pointers allowed me to treat the tree structure as I would in a garbage collected language. Children can be replaced without having to free the old child, as box pointers automatically free their contents when they're overwritten or go out of scope. Compared to the currently popular languages for systems programming, C and C++, this is a nice usability improvement and removes the possibility of leaking memory.\\
+
+Furthermore, it is comforting to have the compiler guarantee the validity and uniqueness of all pointers. Uniqueness is useful because multiple pointers to a single node in a tree structure are never desired, and validity allows code to be written without fear of forgetting a null check. In place of null pointers, Rust's \code{Option<T>} type makes the possibility of non-existence explicit in the value's type and forbids accidentally omitting non-existence checks. Option types have been present in functional languages like Haskell and ML for more than 20 years, but have seen relatively scarce adoption in mainstream languages due to the lack of type system infrastructure (ADTs and pattern matching). As a systems language, Rust strives to avoid runtime penalties for its abstractions, and to this end an \code{Option<Box<T>>} is optimised to a raw pointer with value \code{NULL (0)} if and only if its Rust value is \code{None}.\\
+
+One final aspect of Rust's ownership system is that the mutability of variables is always explicit (with immutability being the default). This enables a style of programming where all values are immutable and only made mutable as required. In contrast to C++'s \code{const} I found this to be very unobtrusive, with most values remaining immutable. Tracking down mutation bugs when most values are immutable is also more straight-forward.
+
+\subsection{Challenges}
+
+The primary challenge when constructing a hierarchy of owned pointers is how to sensibly and efficiently deal with back-links (or rather, the lack thereof). In a tree, all nodes are owned by their parent and no back references are permitted, as borrowing even an immutable pointer to the parent would prevent any mutation of the parent for the life of the borrow (this is the heart of Rust's borrowing system). What then should be done in the case where a child needs to update its parent? In Java or another imperative language, another approach would be to store two (mutable) references, one to the parent and one to the current node, but this too is disallowed by Rust's borrow checker. Drawing inspiration from functional languages, the solution I employed uses recursion liberally and an abstract action type that can be applied after the initial borrow expires.
+
+\begin{minted}{rust}
+enum DeleteAction<K, V> {
+    Replace(Box<TrieNode<K, V>>),
+    Delete,
+    DoNothing
+}
+\end{minted}
+
+This is the action type described above, which captures the three possible operations that might need to be performed during the removal of a key from the trie. Conceptually, the removal is performed from one level above the node to be removed, with the action determined by recursively examining the child node's subtree.
+
+\begin{minted}{rust}
+// Recurse down the Trie working out what to do.
+let (value, delete_action) = match self.children[bucket] {
+    None => (None, DoNothing),
+    Some(box ref mut existing_child) => {
+        // Examine the child to work out if it should be deleted...
+    }
+};
+
+// Apply the computed delete action.
+match delete_action {
+    Replace(node) => {
+        self.children[bucket] = Some(node);
+        (value, DoNothing)
+    }
+
+    Delete => {
+        self.take_child(bucket);
+
+        // The removal of a child could cause this node to be replaced or deleted.
+        (value, self.delete_node())
+    }
+
+    DoNothing => (value, DoNothing)
+}
+\end{minted}
+
+The borrow of \code{self.children[bucket]} expires at the end of the let expression, allowing it to be re-assigned or deleted when applying the delete action. After initially using boolean values to convey deletion information, I was pleased to settle on the action enum, as it makes the intent very clear. Rust's support for tuples can also be seen here, with the first element of the tuple propagating the \textit{value} for the removed key up to the top. Interestingly, the call stack here can be seen as providing the necessary insulation for memory safety, which a manually implemented stack and loop cannot be guaranteed to do. The only negative.
+
+\section{Errors and Bugs}
+
+\section{Parametric Mutability}
+
+\section{Performance}
+
+\section{Further Work}
+
+\section{Conclusion}
+
+\section{References}
+
+https://github.com/rust-lang/rust/issues/217
+
+\end{document}
