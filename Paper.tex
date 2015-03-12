@@ -107,7 +107,20 @@ The borrow of \code{self.children[bucket]} expires at the end of the let express
 
 One negative side-effect of the delayed action approach is that it prevents the function from being tail-recursive, thus destroying the opportunity to perform tail call optimisation. Within the context of Rust this turns out not to be a problem, as tail call optimisation was deemed to interact badly with Rust's memory model, and is unlikely to be added in the near future [reference].
 
-\section{Errors and Bugs}
+\section{Bugs and Testing}
+
+Although Rust's memory model removes several classes of bugs, it is naturally still possible to compile code containing logical errors. During the implementation of my radix trie I spent a lot of time debugging problems which ended up being logical errors in the supporting \code{NibbleVec} library, which I wrote a few months ago to support a radix trie implementation. As per the test driven development methodology, I wrote reasonably extensive unit tests and convinced myself of the library's correctness. However, when it came to using the \code{NibbleVec} code in situations where numerous methods were called sequentially, things started to go awry.\\
+
+The first bug I discovered was in the \code{split\_odd} method, which is meant to split a \code{NibbleVec} at an odd index into two new nibble vectors. Recall that \code{NibbleVec} is a wrapper around a vector of bytes, Rust's \code{Vec<u8>} type. The bug involved the split byte not having its second half zeroed after it was copied to the tail vector. Subsequent calls to push, which uses binary OR to mix in a new value, then resulted in stale data being combined with newly inserted data. This created all sorts of zany bugs in the radix trie implementation which didn't appear in any of the \code{NibbleVec} unit tests due to the reliance on sequential operations. I argue that this bug could have been prevented with invariant checking, or unit tests that examine the library's underlying data representation instead of just its interface. The invariant violated is one that I had in mind while writing the library, and could ideally have generated a compile-time error in a formally verified language:
+\begin{eqnarray*}
+\code{self.length \% 2 == 1} \rightarrow \code{self.data[self.data.len() - 1] & 0x0F == 0}
+\end{eqnarray*}
+
+Alternatively, a function to check the integrity of a \code{NibbleVec} could be written and called after each operation in the test suite. This approach fits better with the rest of the Rust language, and is similar to the approach I adopted in the radix trie library itself (see \code{Trie::check\_integrity}).\\
+
+The second bug was rather similar to the first, but involved \code{split\_even}, which is meant to split a nibble vector at an even index. An off by 1 error in some of the arithmetic lead to the underlying data vector containing one more element than it should, resulting in corruption upon subsequent operations. The integrity/invariant checking approaching described above would have caught this bug as well.\\
+
+The lesson I've learnt from this, is that careful testing is still required in nice languages where everything \textit{looks} correct. Unit testing in Rust really is quite pleasant thanks to the built-in testing framework and the vast number of tests that don't have to be written. Unlike C/C++, there's no need to test safe Rust code for memory corruption (although \code{unsafe} blocks forfeit this nicety). On the other end of the spectrum, Rust is unlike dynamically typed languages in that there's no need to test the behaviour of functions on badly typed input (for example: passing an integer to a function that expects a string in JS or Python). Furthermore, unlike Go, Java and other statically typed languages that permit null references, there's no need to write test cases involving nulls. In this respect, testing Rust code feels like testing Haskell code.
 
 \section{Parametric Mutability}
 
@@ -120,5 +133,9 @@ One negative side-effect of the delayed action approach is that it prevents the 
 \section{References}
 
 https://github.com/rust-lang/rust/issues/217
+
+https://github.com/michaelsproul/rust\_nibble\_vec/commit/69edc98774656ec0b44ede9b34fce0d4ddb57fbb
+
+https://github.com/rust-lang/rust/commit/a4d22635e1453d77e90c4335f5c2e1f62e3185eb
 
 \end{document}
