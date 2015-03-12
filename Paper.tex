@@ -103,7 +103,9 @@ match delete_action {
 }
 \end{minted}
 
-The borrow of \code{self.children[bucket]} expires at the end of the let expression, allowing it to be re-assigned or deleted when applying the delete action. After initially using boolean values to convey deletion information, I was pleased to settle on the action enum, as it makes the intent very clear. Rust's support for tuples can also be seen here, with the first element of the tuple propagating the \textit{value} for the removed key up to the top. Interestingly, the call stack here can be seen as providing the necessary insulation for memory safety, which a manually implemented stack and loop cannot be guaranteed to do. The only negative.
+The borrow of \code{self.children[bucket]} expires at the end of the let expression, allowing it to be re-assigned or deleted when applying the delete action. After initially using boolean values to convey deletion information, I was pleased to settle on the action enum, as it makes the intent very clear. Rust's support for tuples can be seen here, with the first element of the tuple propagating the remove \textit{value} up to the top. Interestingly, the call stack can be seen as providing the necessary insulation for memory safety; it ensures that only one mutable reference to a \code{TrieNode<K, V>} is valid at any one time. Unlike the recursive approach, using a stack data structure and a loop cannot be verified as memory safe by the Rust compiler.\\
+
+One negative side-effect of the delayed action approach is that it prevents the function from being tail-recursive, thus destroying the opportunity to perform tail call optimisation. Within the context of Rust this turns out not to be a problem, as tail call optimisation was deemed to interact badly with Rust's memory model, and is unlikely to be added in the near future [reference].
 
 \section{Errors and Bugs}
 
