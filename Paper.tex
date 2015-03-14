@@ -7,11 +7,13 @@
 \usepackage{amsmath, amssymb}
 \usepackage{mathtools}
 \usepackage{minted}
+\usepackage[T1]{fontenc}
 \setlength\parindent{0pt}
 \setcounter{secnumdepth}{0}
 \pagestyle{empty}
 
 \newcommand{\code}{\texttt}
+\newcommand{\tildex}{\char`\~}
 
 % Graphics
 % \begin{figure}[h]
@@ -105,7 +107,48 @@ match delete_action {
 
 The borrow of \code{self.children[bucket]} expires at the end of the let expression, allowing it to be re-assigned or deleted when applying the delete action. After initially using boolean values to convey deletion information, I was pleased to settle on the action enum, as it makes the intent very clear. Rust's support for tuples can be seen here, with the first element of the tuple propagating the remove \textit{value} up to the top. Interestingly, the call stack can be seen as providing the necessary insulation for memory safety; it ensures that only one mutable reference to a \code{TrieNode<K, V>} is valid at any one time. Unlike the recursive approach, using a stack data structure and a loop cannot be verified as memory safe by the Rust compiler.\\
 
-One negative side-effect of the delayed action approach is that it prevents the function from being tail-recursive, thus destroying the opportunity to perform tail call optimisation. Within the context of Rust this turns out not to be a problem, as tail call optimisation was deemed to interact badly with Rust's memory model, and is unlikely to be added in the near future [reference].
+One negative side-effect of the delayed action approach is that it prevents the function from being tail-recursive, thus destroying the opportunity to perform tail call optimisation. Within the context of Rust this turns out not to be a problem, as tail call optimisation was deemed to interact badly with Rust's memory model and is unlikely to be added in the near future [reference].
+
+\section{Parametric Mutability and Macros}
+
+Rust's strict distinction between mutable and immutable values becomes slightly awkward when writing functions that differ only in the mutability of their arguments or results. Following the design of the Rust standard data-structures I set out to provide both \code{get} and \code{get\_mut} methods for my radix trie. The logic for these two methods is identical except for the sprinkling of a few \code{mut} keywords, which present-day Rust doesn't provide syntax to abstract over. Several Rust developers have suggested a syntax similar to the following [reference]:
+
+\begin{minted}{rust}
+fn get<~m>(&~m self, key: K) -> Option <&~m self>;
+\end{minted}
+
+Here \code{\tildex m} is an imagined mutability parameter that could take the values \code{const} or \code{mut} and be used in patterns like \code{Some(ref \tildex m x)}.\\
+
+To work around the lack of parametric mutability I turned to Rust's macro system, which was recently stabilised in preparation for Rust 1.0 [reference]. Although generally agreed to be less than ideal, the macro system includes several nice features including hygiene and separator-based capturing of multiple items. As the two get functions differ only in the placement of the \code{mut} keyword, I designed the macro to take the keyword (or lack of keyword) as an argument, drawing inspiration from the approach used in TrieMap [reference]. The resulting macro signature looks like this:
+
+\begin{minted}{rust}
+macro_rules! get_function {
+    (name: $name:ident, mutability: $($mut_:tt)*) => {
+        // body
+    }
+} // $
+\end{minted}
+
+The macro takes the function name (\code{\$name}) as an identifier, and zero or more arbitrary \textit{token trees} to describe the mutability. Of the current categories of parameters which can be passed to a macro, a token tree is the only kind that accepts a \code{mut} keyword. The two macro invocations used to generate the get functions are:
+
+\begin{minted}{rust}
+get_function!(name: get_mut, mutability: mut);
+get_function!(name: get, mutability: );
+\end{minted}
+
+The zero-or-more match is required for the immutable case where no mutability argument is passed. Inside the body of the macro, this leads to some messy patterns (a total of 7).
+
+\begin{minted}{rust}
+match existing_child.key_value {
+    Some(ref $($mut_)* kv) => {
+        check_keys(&kv.key, key);
+        Some(& $($mut_)* kv.value)
+    },
+    None => None
+}
+\end{minted}
+
+A quirk in the macro system whereby token trees can only be used as macro arguments also requires the entire macro body to be wrapped in an identity macro. The resulting tangle of dollar signs and arguments broken over multiple lines is quite intimidating, but still seems better than writing and maintaining two near-identical functions. In the future I may try to replace the macro with a generic function that takes several higher-order functions as its arguments. My only fear for this approach is that it will needlessly increase conceptual complexity relative to shuffling \code{mut} keywords around.
 
 \section{Bugs and Testing}
 
@@ -113,7 +156,7 @@ Although Rust's memory model removes several classes of bugs, it is naturally st
 
 The first bug I discovered was in the \code{split\_odd} method, which is meant to split a \code{NibbleVec} at an odd index into two new nibble vectors. Recall that \code{NibbleVec} is a wrapper around a vector of bytes, Rust's \code{Vec<u8>} type. The bug involved the split byte not having its second half zeroed after it was copied to the tail vector. Subsequent calls to push, which uses binary OR to mix in a new value, then resulted in stale data being combined with newly inserted data. This created all sorts of zany bugs in the radix trie implementation which didn't appear in any of the \code{NibbleVec} unit tests due to the reliance on sequential operations. I argue that this bug could have been prevented with invariant checking, or unit tests that examine the library's underlying data representation instead of just its interface. The invariant violated is one that I had in mind while writing the library, and could ideally have generated a compile-time error in a formally verified language:
 \begin{eqnarray*}
-\code{self.length \% 2 == 1} \rightarrow \code{self.data[self.data.len() - 1] & 0x0F == 0}
+\code{self.length \% 2 == 1} \rightarrow \code{self.data[self.data.len() - 1] \& 0x0F == 0}
 \end{eqnarray*}
 
 Alternatively, a function to check the integrity of a \code{NibbleVec} could be written and called after each operation in the test suite. This approach fits better with the rest of the Rust language, and is similar to the approach I adopted in the radix trie library itself (see \code{Trie::check\_integrity}).\\
@@ -121,8 +164,6 @@ Alternatively, a function to check the integrity of a \code{NibbleVec} could be 
 The second bug was rather similar to the first, but involved \code{split\_even}, which is meant to split a nibble vector at an even index. An off by 1 error in some of the arithmetic lead to the underlying data vector containing one more element than it should, resulting in corruption upon subsequent operations. The integrity/invariant checking approaching described above would have caught this bug as well.\\
 
 The lesson I've learnt from this, is that careful testing is still required in nice languages where everything \textit{looks} correct. Unit testing in Rust really is quite pleasant thanks to the built-in testing framework and the vast number of tests that don't have to be written. Unlike C/C++, there's no need to test safe Rust code for memory corruption (although \code{unsafe} blocks forfeit this nicety). On the other end of the spectrum, Rust is unlike dynamically typed languages in that there's no need to test the behaviour of functions on badly typed input (for example: passing an integer to a function that expects a string in JS or Python). Furthermore, unlike Go, Java and other statically typed languages that permit null references, there's no need to write test cases involving nulls. In this respect, testing Rust code feels like testing Haskell code.
-
-\section{Parametric Mutability}
 
 \section{Performance}
 
@@ -137,5 +178,11 @@ https://github.com/rust-lang/rust/issues/217
 https://github.com/michaelsproul/rust\_nibble\_vec/commit/69edc98774656ec0b44ede9b34fce0d4ddb57fbb
 
 https://github.com/rust-lang/rust/commit/a4d22635e1453d77e90c4335f5c2e1f62e3185eb
+
+http://internals.rust-lang.org/t/parameterisation-over-mutability/235
+
+https://github.com/rust-lang/rfcs/blob/master/text/0453-macro-reform.md
+
+https://github.com/Gankro/collect-rs/blob/8392f925094a947629327195cce405bfdf11ba0e/src/trie/map.rs\#L435
 
 \end{document}
